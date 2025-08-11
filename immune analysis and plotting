@@ -1,0 +1,253 @@
+import pandas as pd
+import numpy as np
+!pip install scikit-allel
+import allel
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+!pip install pybedtools
+import pybedtools
+import os
+os.chdir('/Path/to/file')
+
+# Step 1: Load VCF and extract immune regions
+def load_vcf_immune_regions(vcf_file, immune_bed):
+    """
+    Load VCF and extract variants in immune gene regions
+    """
+    # Using scikit-allel
+    callset = allel.read_vcf(vcf_file)
+    
+    # Create positions dataframe
+    positions = pd.DataFrame({
+        'chrom': callset['variants/CHROM'],
+        'pos': callset['variants/POS']
+    })
+    
+    # Filter for immune regions
+    immune_variants = []
+    for _, region in immune_bed.iterrows():
+        mask = (positions['chrom'] == region['chrom']) & \
+               (positions['pos'] >= region['start_extended']) & \
+               (positions['pos'] <= region['end_extended'])
+        immune_variants.append(positions[mask])
+    
+    immune_positions = pd.concat(immune_variants, ignore_index=True)
+    
+    return callset, immune_positions
+
+# Step 2: Calculate per-SNP Fst (FIXED VERSION)
+def calculate_fst_per_snp(genotypes, pop1_samples, pop2_samples, samples):
+    """
+    Calculate Fst for each SNP between two populations
+    """
+    import allel
+    import numpy as np
+    
+    # Get sample indices
+    pop1_indices = [i for i, sample in enumerate(samples) if sample in pop1_samples]
+    pop2_indices = [i for i, sample in enumerate(samples) if sample in pop2_samples]
+    
+    # Check if samples were found
+    if len(pop1_indices) == 0:
+        raise ValueError(f"No samples found for population 1. Available samples: {list(samples)}")
+    if len(pop2_indices) == 0:
+        raise ValueError(f"No samples found for population 2. Available samples: {list(samples)}")
+    
+    print(f"Population 1: {len(pop1_indices)} samples")
+    print(f"Population 2: {len(pop2_indices)} samples")
+    
+    # Convert to GenotypeArray (this handles the genotype calls properly)
+    gt = allel.GenotypeArray(genotypes)
+    
+    # Create subpopulation indices for Weir & Cockerham Fst
+    subpops = [pop1_indices, pop2_indices]
+    
+    # Calculate Fst using Weir & Cockerham
+    fst_values, _, _ = allel.weir_cockerham_fst(gt, subpops)
+    
+    return fst_values
+    
+# Step 3: Sliding window analysis
+def sliding_window_fst(positions, fst_values, window_size=50000, step_size=10000):
+    """
+    Calculate Fst in sliding windows
+    """
+    results = []
+    
+    for chrom in positions['chrom'].unique():
+        chrom_data = positions[positions['chrom'] == chrom].copy()
+        chrom_fst = fst_values[positions['chrom'] == chrom]
+        
+        min_pos = chrom_data['pos'].min()
+        max_pos = chrom_data['pos'].max()
+        
+        for start in range(min_pos, max_pos, step_size):
+            end = start + window_size
+            
+            # Get SNPs in window
+            window_mask = (chrom_data['pos'] >= start) & (chrom_data['pos'] < end)
+            window_fst = chrom_fst[window_mask]
+            
+            if len(window_fst) > 0:
+                results.append({
+                    'chrom': chrom,
+                    'start': start,
+                    'end': end,
+                    'mean_fst': np.mean(window_fst),
+                    'n_snps': len(window_fst)
+                })
+    
+    return pd.DataFrame(results)
+
+# Step 4: Statistical analysis and outlier detection
+def identify_outliers(fst_data, method='percentile', threshold=0.99):
+    """
+    Identify Fst outliers using different methods
+    """
+    # Remove negative Fst values
+    fst_clean = fst_data[fst_data >= 0]
+    
+    if method == 'percentile':
+        cutoff = np.percentile(fst_clean, threshold * 100)
+        outliers = fst_data >= cutoff
+    
+    elif method == 'zscore':
+        z_scores = stats.zscore(fst_clean)
+        outliers = np.abs(z_scores) > threshold
+    
+    return outliers, cutoff if method == 'percentile' else threshold
+
+# Step 5: Gene annotation
+def annotate_outliers(outlier_positions, immune_genes):
+    """
+    Annotate outlier SNPs with nearest genes
+    """
+    annotations = []
+    
+    for _, snp in outlier_positions.iterrows():
+        # Find overlapping genes
+        overlapping_genes = immune_genes[
+            (immune_genes['chrom'] == snp['chrom']) &
+            (immune_genes['start'] <= snp['pos']) &
+            (immune_genes['end'] >= snp['pos'])
+        ]
+        
+        if len(overlapping_genes) > 0:
+            for _, gene in overlapping_genes.iterrows():
+                annotations.append({
+                    'chrom': snp['chrom'],
+                    'pos': snp['pos'],
+                    'gene': gene['gene_name'],
+                    'fst': snp['fst']
+                })
+    
+    return pd.DataFrame(annotations)
+
+# Step 6: Enrichment testing
+def test_immune_enrichment(all_genes, outlier_genes, immune_gene_list):
+    """
+    Test for enrichment of immune genes in outliers
+    """
+    # Create contingency table
+    immune_outliers = len(set(outlier_genes) & set(immune_gene_list))
+    non_immune_outliers = len(outlier_genes) - immune_outliers
+    immune_total = len(set(all_genes) & set(immune_gene_list))
+    non_immune_total = len(all_genes) - immune_total
+    
+    contingency_table = np.array([
+        [immune_outliers, non_immune_outliers],
+        [immune_total - immune_outliers, non_immune_total - non_immune_outliers]
+    ])
+    
+    # Fisher's exact test
+    odds_ratio, p_value = stats.fisher_exact(contingency_table)
+    
+    return odds_ratio, p_value, contingency_table
+
+# Step 7: Visualization
+def plot_fst_manhattan(fst_data, outlier_threshold, title="Fst Outliers in Immune Regions"):
+    """
+    Create Manhattan plot for Fst values
+    """
+    fig, ax = plt.subplots(figsize=(15, 6))
+    
+    # Color by chromosome
+    colors = plt.cm.Set3(np.linspace(0, 1, len(fst_data['chrom'].unique())))
+    
+    for i, chrom in enumerate(fst_data['chrom'].unique()):
+        chrom_data = fst_data[fst_data['chrom'] == chrom]
+        ax.scatter(chrom_data['pos'], chrom_data['fst'],
+                  c=[colors[i]], alpha=0.6, s=20, label=f'Chr {chrom}')
+    
+    # Add threshold line
+    ax.axhline(y=outlier_threshold, color='red', linestyle='--',
+              label=f'Outlier threshold ({outlier_threshold:.3f})')
+    
+    ax.set_xlabel('Position')
+    ax.set_ylabel('Fst')
+    ax.set_title(title)
+    ax.legend()
+    
+    plt.tight_layout()
+    return fig
+
+# Example usage
+if __name__ == "__main__":
+    # Load your data
+    vcf_file = "geno_vcf.vcf"
+    
+    # Define immune genes (example)
+    immune_genes = pd.DataFrame({
+        'chrom': ['6', '6', '6', '9'],
+        'start': [29691116, 31321649, 31236526, 139865716],
+        'end': [29696008, 31326989, 31241863, 139876018],
+        'gene_name': ['HLA-A', 'HLA-B', 'HLA-C', 'TLR4']
+    })
+    
+    # Run analysis
+    extended_regions = create_immune_gene_bed(immune_genes)
+    callset, immune_positions = load_vcf_immune_regions(vcf_file, extended_regions)
+    
+    # Get sample names from VCF
+    samples = callset['samples']
+    print("="*50)
+    print("SAMPLE NAMES FROM VCF:")
+    print("="*50)
+    for i, sample in enumerate(samples):
+        print(f"{i+1:3d}. {sample}")
+    print("="*50)
+    print(f"Total number of samples: {len(samples)}")
+    print("="*50)
+    
+    # Save sample names to a file for easy reference
+    sample_df = pd.DataFrame({
+        'index': range(len(samples)),
+        'sample_name': samples
+    })
+    sample_df.to_csv('sample_names.csv', index=False)
+    print("Sample names saved to 'sample_names.csv'")
+    
+    # Create a Python list format for easy copy-paste
+    print("\nFor easy copy-paste into your script:")
+    print("samples_list = [")
+    for sample in samples:
+        print(f"    '{sample}',")
+    print("]")
+    print() 
+
+
+    print(f"Population 1 samples: {pop1_samples}")
+    print(f"Population 2 samples: {pop2_samples}")
+    
+    # Calculate Fst (NOW WITH SAMPLES PARAMETER)
+    fst_values = calculate_fst_per_snp(callset['calldata/GT'], pop1_samples, pop2_samples, samples)
+    
+    # Identify outliers
+    outliers, threshold = identify_outliers(fst_values, method='percentile', threshold=0.99)
+    
+    # Annotate and test enrichment
+    outlier_annotations = annotate_outliers(immune_positions[outliers], immune_genes)
+    
+    print(f"Found {outliers.sum()} outliers above {threshold:.3f}")
+    print(f"Annotated {len(outlier_annotations)} outliers to immune genes")
